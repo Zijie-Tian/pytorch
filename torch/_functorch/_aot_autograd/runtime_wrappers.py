@@ -649,6 +649,7 @@ class AOTDispatchSubclassWrapper(CompilerWrapper):
                 subclass_metas=subclass_metas,
                 num_fw_outs_saved_for_bw=self.num_fw_outs_saved_for_bw,
                 is_runtime=True,
+                num_tokens=len(runtime_metadata.tokens),
             )
             return wrapped_outs
 
