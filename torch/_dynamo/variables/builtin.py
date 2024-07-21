@@ -123,7 +123,6 @@ class BuiltinVariable(VariableTracker):
             chr,
             divmod,
             float,
-            getattr,
             int,
             len,
             max,
@@ -1593,6 +1592,56 @@ class BuiltinVariable(VariableTracker):
 
         if isinstance(obj, variables.NNModuleVariable):
             return obj.var_getattr(tx, name)
+
+        elif isinstance(obj, variables.TensorVariable) and name == "grad":
+            if source:
+                # We are going to be raising this tensor as grapharg. So, ensure
+                # that we have real grad value instead of fake tensor value.
+                # Walk through the inputs of the subgraph and find if we already
+                # have the original tensor stored in the graphargs.
+                for grapharg in tx.output.graphargs:
+                    if grapharg.source == source.base:
+                        old_grad = grapharg.example.grad
+                        new_grad = obj.as_proxy().node.meta["example_value"].grad
+
+                        def _grad_changed(old, new):
+                            if old is None or new is None:
+                                return new is not old
+                            try:
+                                if old.shape != new.shape:
+                                    return True
+                                if old.stride() != new.stride():
+                                    return True
+                                return False
+                            except TypeError as te:
+                                # There is a rare edge case in which
+                                # we seem to get symbol mismatches
+                                # for jagged tensor comparison.
+                                # See PYTORCH_TEST_WITH_DYNAMO=1 python test/test_nestedtensor.py
+                                #   -k test_dropout_backward_layout_torch_jagged_cpu
+                                unimplemented(str(te))
+
+                        if _grad_changed(old_grad, new_grad):
+                            if new_grad is not None:
+                                grad_shape_specialized = [
+                                    int(x) for x in new_grad.shape
+                                ]
+                                # We lazily update the grad on the example to its real state as tracked by fake tensor.
+                                # This allocation is fine - it is just a hint. It will not make it to runtime, but it coerces
+                                # the underlying value to always be correct.
+                                grapharg.example.grad = torch.zeros(
+                                    grad_shape_specialized, device=new_grad.device
+                                )
+                            else:
+                                grapharg.example.grad = None
+                        return VariableBuilder(tx, source)(grapharg.example.grad)
+
+                return obj.dynamic_getattr(tx, name)
+            else:
+                example_value = obj.as_proxy().node.meta["example_value"]
+                if example_value.grad is not None:
+                    unimplemented("getattr on non-None grad - NYI")
+                return ConstantVariable(None)
         elif isinstance(
             obj,
             (
@@ -1630,11 +1679,8 @@ class BuiltinVariable(VariableTracker):
                 return SourcelessBuilder.create(tx, member)
         elif istype(obj, UserFunctionVariable) and name in ("__name__", "__module__"):
             return ConstantVariable.create(getattr(obj.fn, name))
-        else:
-            try:
-                return obj.var_getattr(tx, name)
-            except NotImplementedError:
-                return GetAttrVariable(obj, name, **options)
+
+        return obj.var_getattr(tx, name)
 
     def call_setattr(
         self, tx, obj: VariableTracker, name_var: VariableTracker, val: VariableTracker
