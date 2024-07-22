@@ -1577,23 +1577,38 @@ class VariableBuilder:
                 return ConstantVariable.create(value=value, source=self.source)
 
             name = self.source.name()
-            if name not in self.tx.output.frame_state:
-                # Note - this essentially means that if this name gets reused as a tensor,
-                # it will start fully dynamic. That should always be a safe option, and not awfully inefficient.
-                # Alternatively, if we want to improve pef here, we can add a third state of unset, but I am not
-                # sure that is necessary for now.
-                frame_state_entry = FrameStateSizeEntry(scalar=value, size=None)
-            else:
+
+            def update_frame_state(value):
+                if name not in self.tx.output.frame_state:
+                    # Note - this essentially means that if this name gets reused as a tensor,
+                    # it will start fully dynamic. That should always be a safe option, and not awfully inefficient.
+                    # Alternatively, if we want to improve pef here, we can add a third state of unset, but I am not
+                    # sure that is necessary for now.
+                    frame_state_entry = FrameStateSizeEntry(scalar=value, size=None)
+                else:
+                    frame_state_entry = self.tx.output.frame_state[name]
+                    if frame_state_entry.scalar != value:
+                        log.debug(
+                            "automatic dynamic int %s val %s != %s",
+                            name,
+                            value,
+                            frame_state_entry.scalar,
+                        )
+                        frame_state_entry.scalar = None
+                self.tx.output.frame_state[name] = frame_state_entry
+
+            if (st := self.tx.distributed_state) is None:
+                update_frame_state(value)
                 frame_state_entry = self.tx.output.frame_state[name]
-                if frame_state_entry.scalar != value:
-                    log.debug(
-                        "automatic dynamic int %s val %s != %s",
-                        name,
-                        value,
-                        frame_state_entry.scalar,
-                    )
-                    frame_state_entry.scalar = None
-            self.tx.output.frame_state[name] = frame_state_entry
+            elif st.all_states is None:
+                # Preflight, always pretend as if it's static
+                frame_state_entry = FrameStateSizeEntry(size=None, scalar=value)
+                st.local_state.input_sizes[name] = value
+            else:
+                # Apply the updates
+                for sub_state in st.all_states:
+                    update_frame_state(sub_state.input_sizes[name])
+                frame_state_entry = self.tx.output.frame_state[name]
 
             # TODO: This should be dynamic, as we in general do not
             # know if bare integers are actually going to be sizevars
@@ -2227,38 +2242,53 @@ def _automatic_dynamic(
         )
 
     # Prep for automatic dynamic
-    frame_state_entry = None
-    if name not in tx.output.frame_state:
-        # If there is no entry for this source, add the tensor to frame state with its current static size.
-        # E.g., {} -> {"x": [2, 4]}
-        frame_state_entry = FrameStateSizeEntry(None, None)
-        frame_state_entry.size = list(e.size())
-    else:
+    def update_frame_state(size):
+        frame_state_entry = None
+        if name not in tx.output.frame_state:
+            # If there is no entry for this source, add the tensor to frame state with its current static size.
+            # E.g., {} -> {"x": [2, 4]}
+            frame_state_entry = FrameStateSizeEntry(None, None)
+            frame_state_entry.size = list(size)
+        else:
+            frame_state_entry = tx.output.frame_state[name]
+            if frame_state_entry.size is not None:
+                if len(size) != len(frame_state_entry.size):
+                    # If there is already an entry, and the dim mismatches, replace the frame state entry with None.
+                    # E.g. {"x": [2, 3, 4]} -> {"x": None}
+                    log.debug(
+                        "automatic dynamic %s dim %s != %s",
+                        name,
+                        len(size),
+                        frame_state_entry.size,
+                    )
+                    frame_state_entry.size = None
+                else:
+                    # If there is already an entry, and the dim matches, for every size in the frame state which
+                    # disagrees with the current static size, replace it with None. E.g., {"x": [2, 3]} -> {"x": [2, None]}
+                    for i, dim in enumerate(frame_state_entry.size):
+                        if dim is not None and size[i] != dim:
+                            log.debug(
+                                "automatic dynamic %s size(%s) %s != %s",
+                                name,
+                                i,
+                                size[i],
+                                dim,
+                            )
+                            frame_state_entry.size[i] = None
+        tx.output.frame_state[name] = frame_state_entry
+
+    if (st := tx.distributed_state) is None:
+        update_frame_state(e.size())
         frame_state_entry = tx.output.frame_state[name]
-        if frame_state_entry.size is not None:
-            if e.ndim != len(frame_state_entry.size):
-                # If there is already an entry, and the dim mismatches, replace the frame state entry with None.
-                # E.g. {"x": [2, 3, 4]} -> {"x": None}
-                log.debug(
-                    "automatic dynamic %s dim %s != %s",
-                    name,
-                    e.ndim,
-                    frame_state_entry.size,
-                )
-                frame_state_entry.size = None
-            else:
-                # If there is already an entry, and the dim matches, for every size in the frame state which
-                # disagrees with the current static size, replace it with None. E.g., {"x": [2, 3]} -> {"x": [2, None]}
-                for i, dim in enumerate(frame_state_entry.size):
-                    if dim is not None and e.size()[i] != dim:
-                        log.debug(
-                            "automatic dynamic %s size(%s) %s != %s",
-                            name,
-                            i,
-                            e.size(i),
-                            dim,
-                        )
-                        frame_state_entry.size[i] = None
+    elif st.all_states is None:
+        # Preflight, always pretend as if it's static
+        frame_state_entry = FrameStateSizeEntry(size=e.size(), scalar=None)
+        st.local_state.input_sizes[name] = list(e.size())
+    else:
+        # Apply the updates
+        for sub_state in st.all_states:
+            update_frame_state(sub_state.input_sizes[name])
+        frame_state_entry = tx.output.frame_state[name]
 
     # TODO: index export_constraints ahead of time so we don't have to
     # do a linear scan every time here
@@ -2374,8 +2404,6 @@ def _automatic_dynamic(
             dynamic = DimDynamic.DUCK
 
         dynamic_dims.append(dynamic)
-
-    tx.output.frame_state[name] = frame_state_entry
 
     return StatefulSymbolicContext(
         dynamic_sizes=dynamic_dims,
