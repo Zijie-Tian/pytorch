@@ -899,13 +899,17 @@ class SchedulerNode(BaseSchedulerNode):
         return buffers_store_as_atomic_add
 
 
-def init_group_node(
+def is_group_snode(snode: BaseSchedulerNode) -> bool:
+    return isinstance(snode, (FusedSchedulerNode, GroupedSchedulerNode))
+
+
+def init_group_snode(
     group_snode: BaseSchedulerNode,
     scheduler: Scheduler,
     snodes: List[BaseSchedulerNode],
 ) -> None:
-    assert isinstance(group_snode, (FusedSchedulerNode, GroupedSchedulerNode))
-    group_snode.snodes = snodes
+    assert is_group_snode(group_snode)
+    group_snode.snodes = snodes  # type: ignore[attr-defined]
     group_snode.scheduler = scheduler
     group_snode.node = None
     group_snode.ancestors = set.union(
@@ -922,8 +926,8 @@ def init_group_node(
         if dep.name not in group_snode.get_names()
     } - group_snode.read_writes.writes
 
-    group_snode.min_order = min(x.min_order for x in group_snode.snodes)
-    group_snode.max_order = max(x.max_order for x in group_snode.snodes)
+    group_snode.min_order = min(x.min_order for x in group_snode.snodes)  # type: ignore[attr-defined]
+    group_snode.max_order = max(x.max_order for x in group_snode.snodes)  # type: ignore[attr-defined]
 
 
 class FusedSchedulerNode(BaseSchedulerNode):
@@ -947,7 +951,7 @@ class FusedSchedulerNode(BaseSchedulerNode):
 
     def __init__(self, scheduler: Scheduler, snodes: List[BaseSchedulerNode]) -> None:
         # NB: No need to call super().__init__() because we don't need to re-use any of its logic.
-        init_group_node(self, scheduler, snodes)
+        init_group_snode(self, scheduler, snodes)
         self.users: List[NodeUser] = []
         self.group = max(snodes, key=lambda x: int(x.is_reduction())).group
 
@@ -1325,7 +1329,7 @@ class GroupedSchedulerNode(BaseSchedulerNode):
 
     def __init__(self, scheduler: Scheduler, snodes: List[BaseSchedulerNode]) -> None:
         # NB: No need to call super().__init__() because we don't need to re-use any of its logic.
-        init_group_node(self, scheduler, snodes)
+        init_group_snode(self, scheduler, snodes)
 
     def unpack(self) -> List[BaseSchedulerNode]:
         """
@@ -1343,6 +1347,10 @@ class GroupedSchedulerNode(BaseSchedulerNode):
 
     def get_first_name(self) -> str:
         return self.snodes[0].get_name()
+
+    @cache_on_self
+    def get_names(self) -> Set[str]:
+        return set.union(*[x.get_names() for x in self.snodes])
 
     @classmethod
     def can_fuse(cls, producer: BaseSchedulerNode, consumer: BaseSchedulerNode) -> bool:
@@ -1482,9 +1490,13 @@ class Scheduler:
         self.compute_dependencies()
         self.nodes = self.topological_sort_schedule(self.nodes)
         self.dead_node_elimination()
-        if config.reorder_for_compute_comm_overlap:
-            comms.decide_global_ordering_of_comms(self.nodes)
+        self.compute_order()
         self.compute_ancestors()
+        if config.reorder_for_compute_comm_overlap:
+            self.nodes = comms.decide_global_ordering_of_comms(
+                self.nodes, self.name_to_fused_node
+            )
+            self.compute_ancestors()
 
         metrics.ir_nodes_pre_fusion += len(self.nodes)
         V.debug.ir_pre_fusion(self.nodes)
@@ -1848,6 +1860,14 @@ class Scheduler:
             visit(node)
         return result
 
+    def compute_order(self) -> None:
+        """
+        Populate each node.min_order and node.max_order
+        """
+        for order, node in enumerate(self.nodes):
+            node.min_order = order
+            node.max_order = order
+
     def compute_ancestors(self) -> None:
         """
         Populate each node.ancestors
@@ -1861,10 +1881,6 @@ class Scheduler:
                 ancestors |= name_to_ancestors[dep.name]
             name_to_ancestors[node.get_name()] = ancestors
             node.ancestors = ancestors
-
-        for order, node in enumerate(self.nodes):
-            node.min_order = order
-            node.max_order = order
 
     def fuse_nodes(self, nodes: List[BaseSchedulerNode]) -> List[BaseSchedulerNode]:
         """
